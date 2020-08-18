@@ -57,8 +57,11 @@ class BgenReader(object):
         if len(seeks_for_chunk) == 0:
             return np.empty((0, 0), dtype=self.dtype)
         with PyBGEN(self.path, probs_only=True) as bgen:
-            p = [_to_dosage(probs[idx[1]]) for (_, probs) in bgen._iter_seeks(seeks_for_chunk)]
-            return np.stack(p)
+            shape = (len(seeks_for_chunk), idx[1].stop - idx[1].start)
+            res = np.zeros(shape, dtype=self.dtype)
+            for i, (_, probs) in enumerate(bgen._iter_seeks(seeks_for_chunk)):
+                res[i] = _to_dosage(probs[idx[1]])
+            return res
 
         
 def _to_dosage(probs: ArrayLike):

@@ -2,6 +2,7 @@ import numpy as np
 import numpy.testing as npt
 import pytest
 from sgkit_bgen import read_bgen
+from sgkit_bgen.bgen_reader import BgenReader
 
 CHUNKS = [
     (100, 200, 3),
@@ -113,6 +114,17 @@ def test_read_bgen_scalar_index(shared_datadir, chunks):
                 EXPECTED_PROBABILITIES[i, j],
                 decimal=3,
             )
+
+
+def test_read_bgen_raise_on_invalid_indexers(shared_datadir):
+    path = shared_datadir / "example.bgen"
+    reader = BgenReader(path)
+    with pytest.raises(IndexError, match="Indexer must be tuple"):
+        reader[[0]]
+    with pytest.raises(IndexError, match="Indexer must have 3 items"):
+        reader[(slice(None),)]
+    with pytest.raises(IndexError, match="Indexer must contain only slices or ints"):
+        reader[([0], [0], [0])]
 
 
 # TODO:

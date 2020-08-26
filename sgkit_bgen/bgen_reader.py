@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import (
     Any,
     Callable,
+    Dict,
     Hashable,
     MutableMapping,
     Optional,
@@ -14,6 +15,7 @@ from typing import (
 
 import dask
 import dask.array as da
+import dask.dataframe as dd
 import numpy as np
 import xarray as xr
 import zarr
@@ -35,7 +37,7 @@ PathType = Union[str, Path]
 STRING_VARS = ["variant_id", "variant_allele", "sample_id"]
 
 
-def _to_dict(df, dtype=None):
+def _to_dict(df: dd.DataFrame, dtype: Any = None) -> Dict[str, da.Array]:
     return {
         c: df[c].to_dask_array(lengths=True).astype(dtype[c] if dtype else df[c].dtype)
         for c in df
@@ -59,7 +61,9 @@ class BgenReader:
 
     name = "bgen_reader"
 
-    def __init__(self, path, persist=True, dtype=np.float32):
+    def __init__(
+        self, path: PathType, persist: bool = True, dtype: Any = np.float32
+    ) -> None:
         self.path = Path(path)
 
         self.metafile_filepath = infer_metafile_filepath(Path(self.path))
@@ -80,11 +84,13 @@ class BgenReader:
             self.contig = variant_arrs["chrom"]
             self.pos = variant_arrs["pos"]
 
-            def split_alleles(alleles, block_info=None):
+            def split_alleles(
+                alleles: np.ndarray, block_info: Any = None
+            ) -> np.ndarray:
                 if block_info is None or len(block_info) == 0:
                     return alleles
 
-                def split(allele_row):
+                def split(allele_row: np.ndarray) -> np.ndarray:
                     alleles_list = allele_row[0].split(",")
                     assert len(alleles_list) == 2  # bi-allelic
                     return np.array(alleles_list)
@@ -115,17 +121,15 @@ class BgenReader:
         self.dtype = dtype
         self.ndim = 3
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: Any) -> np.ndarray:
         if not isinstance(idx, tuple):
-            raise IndexError(  # pragma: no cover
-                f"Indexer must be tuple (received {type(idx)})"
-            )
+            raise IndexError(f"Indexer must be tuple (received {type(idx)})")
         if len(idx) != self.ndim:
-            raise IndexError(  # pragma: no cover
-                f"Indexer must be two-item tuple (received {len(idx)} slices)"
+            raise IndexError(
+                f"Indexer must have {self.ndim} items (received {len(idx)} slices)"
             )
         if not all(isinstance(i, slice) or isinstance(i, int) for i in idx):
-            raise IndexError(  # pragma: no cover
+            raise IndexError(
                 f"Indexer must contain only slices or ints (received types {[type(i) for i in idx]})"
             )
         # Determine which dims should have unit size in result
@@ -169,11 +173,11 @@ class BgenReader:
                 if res is None:
                     res = np.zeros((len(all_vaddr), len(probs), 3), dtype=self.dtype)
                 res[i] = probs
-            res = res[..., idx[2]]
+            res = res[..., idx[2]]  # type: ignore[index]
             return np.squeeze(res, axis=squeeze_dims)
 
 
-def _to_dosage(probs: ArrayLike):
+def _to_dosage(probs: ArrayLike) -> ArrayLike:
     """Calculate the dosage from genotype likelihoods (probabilities)"""
     assert (
         probs.shape[-1] == 3
@@ -183,7 +187,7 @@ def _to_dosage(probs: ArrayLike):
 
 def read_bgen(
     path: PathType,
-    chunks: Union[str, int, tuple] = "auto",
+    chunks: Union[str, int, Tuple[int, ...]] = "auto",
     lock: bool = False,
     persist: bool = True,
     dtype: Any = "float32",
@@ -239,7 +243,7 @@ def read_bgen(
     )
     call_dosage = _to_dosage(call_genotype_probability)
 
-    ds = create_genotype_dosage_dataset(
+    ds: Dataset = create_genotype_dosage_dataset(
         variant_contig_names=variant_contig_names,
         variant_contig=variant_contig,
         variant_position=variant_position,

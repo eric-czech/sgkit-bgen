@@ -113,3 +113,8 @@ def test_read_bgen_scalar_index(shared_datadir, chunks):
                 EXPECTED_PROBABILITIES[i, j],
                 decimal=3,
             )
+
+
+# TODO:
+# - test that encoded GP works
+# - test that str max len works

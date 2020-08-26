@@ -1,6 +1,7 @@
 """BGEN reader implementation (using bgen_reader)"""
 from pathlib import Path
 from typing import Any, Dict, Hashable, MutableMapping, Optional, Sequence, Tuple, Union
+from typing_extensions import Literal
 
 import dask.array as da
 import dask.dataframe as dd
@@ -83,15 +84,7 @@ class BgenReader:
 
                 return np.apply_along_axis(split, 1, alleles[:, np.newaxis])
 
-            variant_alleles = variant_arrs["allele_ids"].map_blocks(split_alleles)
-
-            def max_str_len(arr: ArrayLike) -> Any:
-                return arr.map_blocks(
-                    lambda s: np.char.str_len(s.astype(str)), dtype=np.int8
-                ).max()
-
-            max_allele_length = max(max_str_len(variant_alleles).compute())
-            self.variant_alleles = variant_alleles.astype(f"S{max_allele_length}")
+            self.variant_alleles = variant_arrs["allele_ids"].map_blocks(split_alleles)
 
         with bgen_file(self.path) as bgen:
             sample_path = self.path.with_suffix(".sample")
@@ -177,6 +170,7 @@ def read_bgen(
     lock: bool = False,
     persist: bool = True,
     dtype: Any = "float32",
+    fixed_length_strings: bool = False
 ) -> Dataset:
     """Read BGEN dataset.
 
@@ -201,6 +195,9 @@ def read_bgen(
         be read multiple times when False.
     dtype : Any
         Genotype probability array data type, by default float32.
+    fixed_length_strings : bool
+        Whether or not to coerce string arrays to a fixed-length type,
+        by default False.
 
     Warnings
     --------
@@ -212,13 +209,16 @@ def read_bgen(
     variant_contig, variant_contig_names = encode_array(bgen_reader.contig.compute())
     variant_contig_names = list(variant_contig_names)
     variant_contig = variant_contig.astype("int16")
+    variant_position = np.asarray(bgen_reader.pos, dtype=int)
+    variant_alleles = np.asarray(to_fixlen_str_array(bgen_reader.variant_alleles))
 
-    variant_position = np.array(bgen_reader.pos, dtype=int)
-    variant_alleles = np.array(bgen_reader.variant_alleles, dtype=str)
-    variant_id = np.array(bgen_reader.variant_id, dtype=str)
-
-    sample_id = np.array(bgen_reader.sample_id, dtype=str)
-
+    if fixed_length_strings:
+        variant_id = np.asarray(to_fixlen_str_array(bgen_reader.variant_id))
+        sample_id = np.asarray(to_fixlen_str_array(bgen_reader.sample_id))
+    else:
+        variant_id = np.asarray(bgen_reader.variant_id, dtype=str)
+        sample_id = np.asarray(bgen_reader.sample_id, dtype=str)
+    
     call_genotype_probability = da.from_array(
         bgen_reader,
         chunks=chunks,
@@ -242,31 +242,27 @@ def read_bgen(
 
     return ds
 
+def to_fixlen_str_array(arr: ArrayLike, kind: Literal["S", "U"]="S") -> ArrayLike:
+    length = int(max_str_len(arr))
+    return arr.astype(f"{kind}{length}")
 
-def _max_str_len(arr: ArrayLike) -> Array:
-    return da.map_blocks(
-        arr, lambda s: np.char.str_len(s.astype(str)), dtype=np.int8
-    ).max()
+def max_str_len(arr: ArrayLike) -> Array:
+    def fn(x):
+        return np.expand_dims(
+            np.char.str_len(x.astype(str)).max(), 
+            list(range(arr.ndim))
+        )
+    return da.map_blocks(fn, arr, chunks=(1,) * arr.ndim, dtype=int).max()
 
 
-def create_bgen_encoding(
+def encode_variables(
     ds: Dataset,
-    *,
-    chunks: Optional[Tuple[int, int]] = None,
-    compressor: Any = zarr.Blosc(cname="zstd", clevel=7, shuffle=2),
+    compressor: Any = zarr.Blosc(cname="zstd", clevel=7, shuffle=2)
 ) -> Dict[Hashable, Dict[str, Any]]:
     # Set compressor, chunking and floating point encoding
     encoding = {}
     for v in ds:
         e = {"compressor": compressor}
-        if chunks is not None:
-            c = {}
-            if "variants" in ds[v].dims:
-                c["variants"] = chunks[0]
-            if "samples" in ds[v].dims:
-                c["samples"] = chunks[1]
-            if c:
-                e["chunks"] = c
         if v == "call_genotype_probability":
             e.update(
                 {
@@ -280,145 +276,71 @@ def create_bgen_encoding(
     return encoding
 
 
-def optimize_bgen_variables(ds: Dataset) -> Dataset:
+def pack_variables(
+    ds: Dataset
+) -> Dataset:
     # Remove dosage as it is unnecessary and should be redefined
     # based on encoded probabilities later (w/ reduced precision)
-    ds = ds.drop_vars(["call_dosage", "call_dosage_mask"], errors="ignore",)
+    ds = ds.drop_vars(["call_dosage", "call_dosage_mask"], errors="ignore")
 
-    # Slice off homozygous ref GP and redefine mask
+    # Remove homozygous reference GP and redefine mask
     gp = ds["call_genotype_probability"][..., 1:]
     gp_mask = ds["call_genotype_probability_mask"].any(dim="genotypes")
     ds = ds.drop_vars(["call_genotype_probability", "call_genotype_probability_mask"])
     ds = ds.assign(call_genotype_probability=gp, call_genotype_probability_mask=gp_mask)
     return ds
 
+def unpack_variables(ds: Dataset, dtype: Any = "float32") -> Dataset:
+    # Restore homozygous reference GP
+    gp = ds['call_genotype_probability'].astype(dtype)
+    if gp.sizes['genotypes'] != 2:
+        raise ValueError(
+            "Expecting variable 'call_genotype_probability' to have genotypes "
+            f"dimension of size 2 (received sizes = {dict(gp.sizes)})"
+        )
+    ds = ds.drop_vars('call_genotype_probability')
+    ds['call_genotype_probability'] = xr.concat([1 - gp.sum(dim='genotypes'), gp], dim='genotypes')
+    
+    # Restore dosage
+    ds['call_dosage'] = gp[..., 0] + 2 * gp[..., 1]
+    ds['call_dosage_mask'] = ds['call_genotype_probability_mask']
+    return ds
 
-def bgen_to_zarr(
+def rechunk_to_zarr(
     ds: Dataset,
     store: Union[PathType, MutableMapping],  # type: ignore[type-arg]
     *,
     mode: str = "w",
-    chunks: Optional[Tuple[int, int]] = None,
+    chunk_length: int = 10_000,
+    chunk_width: int = 10_000,
     compressor: Any = zarr.Blosc(cname="zstd", clevel=7, shuffle=2),
-    compute: bool = True,
+    compute: bool = True
 ) -> ZarrStore:
-    ds = optimize_bgen_variables(ds)
-    encoding = create_bgen_encoding(ds, chunks=chunks, compressor=compressor)
+    ds = pack_variables(ds)
+    for v in ['call_genotype_probability', 'call_genotype_probability_mask']:
+        chunk_size = da.asarray(ds[v]).chunksize[0]
+        if chunk_length % chunk_size != 0:
+            raise ValueError(
+                f"Chunk size in variant dimension for variable '{v}' ({chunk_size}) "
+                f"must evenly divide target chunk size {chunk_length}"
+            )
+        ds[v] = ds[v].chunk(chunks=dict(samples=chunk_width))
+    encoding = encode_variables(ds, compressor=compressor)
     return ds.to_zarr(store, mode=mode, encoding=encoding, compute=compute)
 
-
-def zarrs_to_dataset(
-    stores: Sequence[Union[PathType, MutableMapping]],  # type: ignore[type-arg]
-    chunks: Optional[Tuple[int, int]] = None,
-    string_vars: Optional[Sequence[Hashable]] = None,
-    mask_and_scale: bool = True,
-) -> Dataset:
-    datasets = [xr.open_zarr(store, mask_and_scale=mask_and_scale) for store in stores]  # type: ignore[no-untyped-call]
-    ds = xr.concat(datasets, dim="variants", data_vars="minimal")  # type: ignore[no-untyped-call, no-redef]
-    if chunks is not None:
-        ds = ds.chunk(dict(variants=chunks[0], samples=chunks[1]))
-    if string_vars is not None:
-        for v in string_vars:
-            length = int(_max_str_len(ds[v]))
-            ds[v] = ds[v].astype(f"S{length}")
-    return ds  # type: ignore[no-any-return]
+def rechunk_from_zarr(
+    store: Union[PathType, MutableMapping],
+    chunk_length: int = 10_000,
+    chunk_width: int = 10_000,
+    mask_and_scale: bool = True
+):
+    ds = xr.open_zarr(store, mask_and_scale=mask_and_scale)
+    for v in ['call_genotype_probability', 'call_genotype_probability_mask']:
+        ds[v] = ds[v].chunk(chunks=dict(variants=chunk_length, samples=chunk_width))
+        # Workaround for https://github.com/pydata/xarray/issues/4380
+        del ds[v].encoding['chunks']
+    return ds
 
 
-# * Do we want bgen_to_zarr, bgen_to_zarrs like w/ vcf? *
-
-# def bgen_to_zarrs(
-#     input: Union[PathType, Sequence[PathType]],
-#     output: PathType,
-#     *,
-#     regions: Union[None, slice, Sequence[slice], Sequence[Sequence[slice]]] = None,
-#     chunk_length: int = 100,
-#     chunk_width: int = -1,
-#     target_chunk_width: int = 10_000,
-#     compressor: Any = zarr.Blosc(cname="zstd", clevel=7, shuffle=2),
-#     read_fn: Callable[[Path, Tuple[int, int, int]], Dataset] = read_bgen,
-# ) -> Sequence[Path]:
-#     output = Path(output)
-
-#     if isinstance(input, str) or isinstance(input, Path):
-#         inputs: Sequence[PathType] = [input]
-#     else:
-#         inputs = input
-
-#     if regions is None:
-#         input_regions = [[slice(None)]] * len(inputs)
-#     elif isinstance(regions, slice):
-#         input_regions = [[regions]] * len(inputs)
-#     else:
-#         if len(regions) != len(inputs):
-#             raise ValueError(
-#                 "When providing multiple input files as well as regions within them to convert, "
-#                 "the number of regions must equal the number of input files "
-#                 f"(received {len(inputs)} files and {len(regions)} regions)."
-#             )
-#         input_regions = regions
-
-#     assert len(inputs) == len(input_regions)
-
-#     parts = []
-#     for i, input in enumerate(inputs):
-#         filename = Path(input).name
-#         for r, region in enumerate(input_regions[i]):
-#             part = output / filename / f"part-{r}.zarr"
-#             parts.append(part)
-#             _bgen_to_zarr(
-#                 input=input,
-#                 output=part,
-#                 region=region,
-#                 chunk_length=chunk_length,
-#                 chunk_width=chunk_width,
-#                 target_chunk_width=target_chunk_width,
-#                 compressor=compressor,
-#                 read_fn=read_fn,
-#             )
-#     return parts
-
-
-# def bgen_to_zarr(
-#     input: Union[PathType, Sequence[PathType]],
-#     store: Union[PathType, MutableMapping],
-#     *,
-#     regions: Union[None, slice, Sequence[slice], Sequence[Sequence[slice]]] = None,
-#     chunk_length: int = 10_000,
-#     chunk_width: int = 1_000,
-#     temp_chunk_length: int = 100,
-#     temp_chunk_width: int = -1,
-#     temp_dir: Optional[PathType] = None,
-#     read_fn: Callable[[PathType, Tuple[int, int, int]], Dataset] = read_bgen,
-# ) -> ZarrStore:
-#     """Convert BGEN to Zarr.
-
-#     This operation works in two phases:
-
-#     1. Load raw bgen for very small variant chunks and very large sample
-#         chunks (all of them by default), and write out as temporary zarr
-#         datasets containing the desired sample chunking.
-#     2. Rechunk the temporary result with the desired variant chunking.
-
-#     The inputs and temporary results must be local, but the final output
-#     store can be local or remote.
-#     """
-#     if not temp_dir:
-#         temp_dir = Path(tempfile.mkdtemp(prefix="bgen_to_zarr_"))
-
-#     paths = bgen_to_zarrs(
-#         input,
-#         temp_dir,
-#         regions=regions,
-#         chunk_length=temp_chunk_length,
-#         chunk_width=temp_chunk_width,
-#         read_fn=read_fn,
-#     )
-
-#     ds = zarrs_to_dataset(
-#         paths, chunk_length=chunk_length, chunk_width=chunk_width, mask_and_scale=False
-#     )
-
-#     # Ensure Dask task graph is efficient since there are so many small chunks
-#     # in the temporary results, see https://github.com/dask/dask/issues/5105
-#     with dask.config.set({"optimization.fuse.ave-width": 50}):
-#         return ds.to_zarr(store, mode="w", compute=True)
+def bgen_to_zarr():
+    pass
